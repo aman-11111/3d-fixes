@@ -14,6 +14,12 @@ bl_info = {
     "tracker_url": "https://github.com/DarkStarSword/3d-fixes/issues",
 }
 
+# April-2-2022: (aman) All change are for supporting GoW 2018 game.
+#               normal/tangent are in R10G10B10A2 format which does not support value range (-1,1). added special normal/tragent format handler.
+#               GoW 4-th blendweight is always 0. calculate the 4-th blend-weight by substracting first 3 wight.
+# April-5-2022:  Reverse triangle face indeices order during import so Blender can display backface correctly. reverse back during export
+#                Export vertex tangent with bi-tangent_sign added to A2 (4th compoent). without this signed value bump texture will not look right.  
+
 # TODO:
 # - Option to reduce vertices on import to simplify mesh (can be noticeably lossy)
 # - Option to untesselate triangles on import?
@@ -222,9 +228,74 @@ def EncoderDecoder(fmt):
 
     raise Fatal('File uses an unsupported DXGI Format: %s' % fmt)
 
-def pack_unorm10a2(components):
+def pack_weight(components):  # weight need special handling
     r, g, b = numpy.around(numpy.fromiter(components[0:3], numpy.float32) * 1023.0).astype(numpy.uint32).tolist()
     a,      = numpy.around(numpy.fromiter(components[3:4], numpy.float32) *    3.0).astype(numpy.uint32).tolist()
+    total = r + g + b
+    if total > 1023:       # total weight cannot be greater than 1023
+        diff = (total-1023)   # substract overflow from the lowest weight first
+        if b > diff:
+            b -= diff
+        else:
+            b = 0
+            diff -= b
+            if g > diff:
+                g -= diff
+            else:
+                g = 0
+                diff -= g
+                if r > diff:
+                    r -= diff
+        if (r + g + b ) != 1023:
+            print ('Ooops ',r, g, b, total)
+    a = 0  # A2 bit is unused in GoW        
+    #print (r , g , b, a ,total)
+    rgb_mask = 0b1111111111 # 10-bit mask
+    value  = ( r & rgb_mask       )
+    value |= ((g & rgb_mask) << 10)
+    value |= ((b & rgb_mask) << 20)
+    value |= ((a &     0b11) << 30)
+    return numpy.fromiter([value], numpy.uint32).tobytes()
+
+def unpack_weight(data):
+    value, = numpy.frombuffer(data, numpy.uint32).tolist()
+    rgb_mask = 0b1111111111 # 10-bit mask
+    r = ( value        & rgb_mask)
+    g = ((value >> 10) & rgb_mask)
+    b = ((value >> 20) & rgb_mask)
+    a = ( value >> 30            ) # 2-bit alpha
+    
+    a,      = (numpy.fromiter([ 1023 - r - g - b ], numpy.uint32) / 1023.0).astype(numpy.float32).tolist()
+    r, g, b = (numpy.fromiter([r, g, b], numpy.uint32) / 1023.0).astype(numpy.float32).tolist()
+    #a,      = (numpy.fromiter([a      ], numpy.uint32) / 3.0).astype(numpy.float32).tolist()
+    return [r, g, b, a]
+
+
+def pack_normal(components):
+    r, g, b = numpy.around((numpy.fromiter(components[0:3], numpy.float32) + 1.0) * 511.5).astype(numpy.uint32).tolist()
+    a,      = numpy.around( numpy.fromiter(components[3:4], numpy.float32) ).astype(numpy.uint32).tolist()
+    rgb_mask = 0b1111111111 # 10-bit mask
+    value  = ( r & rgb_mask       )
+    value |= ((g & rgb_mask) << 10)
+    value |= ((b & rgb_mask) << 20)
+    value |= ((a &     0b11) << 30)
+    return numpy.fromiter([value], numpy.uint32).tobytes()
+
+def unpack_normal(data):
+    value, = numpy.frombuffer(data, numpy.uint32).tolist()
+    rgb_mask = 0b1111111111 # 10-bit mask
+    r = ( value        & rgb_mask)
+    g = ((value >> 10) & rgb_mask)
+    b = ((value >> 20) & rgb_mask)
+    a = ( value >> 30            ) # 2-bit alpha
+    r, g, b = (numpy.fromiter([r, g, b], numpy.uint32) / 511.5 - 1.0).astype(numpy.float32).tolist()
+    a,      = (numpy.fromiter([a      ], numpy.uint32) ).astype(numpy.float32).tolist()
+    return [r, g, b, a]
+    
+    
+def pack_unorm10a2(components):
+    r, g, b = numpy.around(numpy.fromiter(components[0:3], numpy.float32) * 1023.0).astype(numpy.uint32).tolist()
+    a,      = numpy.around(numpy.fromiter(components[3:4], numpy.float32) * 3.0).astype(numpy.uint32).tolist()
     rgb_mask = 0b1111111111 # 10-bit mask
     value  = ( r & rgb_mask       )
     value |= ((g & rgb_mask) << 10)
@@ -240,7 +311,7 @@ def unpack_unorm10a2(data):
     b = ((value >> 20) & rgb_mask)
     a = ( value >> 30            ) # 2-bit alpha
     r, g, b = (numpy.fromiter([r, g, b], numpy.uint32) / 1023.0).astype(numpy.float32).tolist()
-    a,      = (numpy.fromiter([a      ], numpy.uint32) /    3.0).astype(numpy.float32).tolist()
+    a,      = (numpy.fromiter([a      ], numpy.uint32) / 3.0).astype(numpy.float32).tolist()
     return [r, g, b, a]
 
 components_pattern = re.compile(r'''(?<![0-9])[0-9]+(?![0-9])''')
@@ -358,8 +429,9 @@ class InputLayoutElement(object):
             self.InstanceDataStepRate == other.InstanceDataStepRate
 
 class InputLayout(object):
-    def __init__(self, custom_prop=[]):
+    def __init__(self, custom_prop=[], stride=0):
         self.elems = collections.OrderedDict()
+        self.stride = stride
         for item in custom_prop:
             elem = InputLayoutElement(item)
             self.elems[elem.name] = elem
@@ -384,24 +456,38 @@ class InputLayout(object):
     def __getitem__(self, semantic):
         return self.elems[semantic]
 
-    def encode(self, vertex, stride):
-        buf = bytearray(stride)
+    def encode(self, vertex):
+        buf = bytearray(self.stride)
 
         for semantic, data in vertex.items():
             if semantic.startswith('~'):
                 continue
             elem = self.elems[semantic]
-            data = elem.encode(data)
+            # Gow : special encode function for weight ,make sure all weight combine is < 1024
+            if elem.SemanticName == 'BLENDWEIGHT' and elem.Format == 'R10G10B10A2_UNORM':
+                data = pack_weight(data)
+            else: # normal and tangent as 10 bit SNORM
+                if  elem.SemanticName in ( 'NORMAL' , 'TANGENT') and elem.Format == 'R10G10B10A2_UNORM':
+                    data = pack_normal(data) # Normal/tangent contains signed normalized  
+                else:
+                    data = elem.encode(data)
             buf[elem.AlignedByteOffset:elem.AlignedByteOffset + len(data)] = data
 
-        assert(len(buf) == stride)
+        assert(len(buf) == self.stride)
         return buf
 
     def decode(self, buf):
         vertex = {}
         for elem in self.elems.values():
             data = buf[elem.AlignedByteOffset:elem.AlignedByteOffset + elem.size()]
-            vertex[elem.name] = elem.decode(data)
+            if elem.SemanticName == 'BLENDWEIGHT' and elem.Format == 'R10G10B10A2_UNORM':
+                vertex[elem.name] = unpack_weight(data)
+            else:
+                # normal and tangent as 10 bits SNORM
+                if  elem.SemanticName in ( 'NORMAL' , 'TANGENT') and elem.Format == 'R10G10B10A2_UNORM':
+                    vertex[elem.name] = unpack_normal(data)  # treat normal as SNORM
+                else:
+                    vertex[elem.name] = elem.decode(data)
         return vertex
 
     def __eq__(self, other):
@@ -413,24 +499,19 @@ class HashableVertex(dict):
         immutable = tuple((k, tuple(v)) for k,v in sorted(self.items()))
         return hash(immutable)
 
-class IndividualVertexBuffer(object):
-    '''
-    One individual vertex buffer. Multiple vertex buffers may contain
-    individual semantics which when combined together make up a vertex buffer
-    group.
-    '''
-
+class VertexBuffer(object):
     vb_elem_pattern = re.compile(r'''vb\d+\[\d*\]\+\d+ (?P<semantic>[^:]+): (?P<data>.*)$''')
 
-    def __init__(self, idx, f=None, layout=None, load_vertices=True):
+    # Python gotcha - do not set layout=InputLayout() in the default function
+    # parameters, as they would all share the *same* InputLayout since the
+    # default values are only evaluated once on file load
+    def __init__(self, f=None, layout=None, load_vertices=True):
         self.vertices = []
         self.layout = layout and layout or InputLayout()
         self.first = 0
         self.vertex_count = 0
         self.offset = 0
         self.topology = 'trianglelist'
-        self.stride = 0
-        self.idx = idx
 
         if f is not None:
             self.parse_vb_txt(f, load_vertices)
@@ -445,7 +526,7 @@ class IndividualVertexBuffer(object):
             if line.startswith('vertex count:'):
                 self.vertex_count = int(line[14:])
             if line.startswith('stride:'):
-                self.stride = int(line[7:])
+                self.layout.stride = int(line[7:])
             if line.startswith('element['):
                 self.layout.parse_element(f)
             if line.startswith('topology:'):
@@ -456,11 +537,7 @@ class IndividualVertexBuffer(object):
                 if not load_vertices:
                     return
                 self.parse_vertex_data(f)
-        # If the buffer is only per-instance elements there won't be any
-        # vertices. If the buffer has any per-vertex elements than we should
-        # have the number of vertices declared in the header.
-        if self.vertices:
-            assert(len(self.vertices) == self.vertex_count)
+        assert(len(self.vertices) == self.vertex_count)
 
     def parse_vb_bin(self, f):
         f.seek(self.offset)
@@ -513,56 +590,6 @@ class IndividualVertexBuffer(object):
 
         return tuple(map(float, fields))
 
-class VertexBufferGroup(object):
-    '''
-    All the per-vertex data, which may be loaded/saved from potentially
-    multiple individual vertex buffers with different semantics in each.
-    '''
-    vb_idx_pattern = re.compile(r'''-vb([0-9]+)''')
-
-    # Python gotcha - do not set layout=InputLayout() in the default function
-    # parameters, as they would all share the *same* InputLayout since the
-    # default values are only evaluated once on file load
-    def __init__(self, files=None, layout=None, load_vertices=True):
-        self.vertices = []
-        self.layout = layout and layout or InputLayout()
-        self.first = 0
-        self.vertex_count = 0
-        self.topology = 'trianglelist'
-        self.vbs = []
-        self.slots = set()
-
-        if files is not None:
-            self.parse_vb_txt(files, load_vertices)
-
-    def parse_vb_txt(self, files, load_vertices):
-        for f in files:
-            match = self.vb_idx_pattern.search(f)
-            if match is None:
-                raise Fatal('Cannot determine vertex buffer index from filename %s' % f)
-            idx = int(match.group(1))
-            vb = IndividualVertexBuffer(idx, open(f, 'r'), self.layout, load_vertices)
-            if vb.vertices:
-                self.vbs.append(vb)
-                self.slots.add(idx)
-
-        # Non buffer specific info:
-        self.first = self.vbs[0].first
-        self.vertex_count = self.vbs[0].vertex_count
-        self.topology = self.vbs[0].topology
-
-        if load_vertices:
-            self.merge_vbs(self.vbs)
-            assert(len(self.vertices) == self.vertex_count)
-
-    def parse_vb_bin(self, files):
-        # FIXME TODO
-        pass
-
-    def append(self, vertex):
-        self.vertices.append(vertex)
-        self.vertex_count += 1
-
     def remap_blendindices(self, obj, mapping):
         def lookup_vgmap(x):
             vgname = obj.vertex_groups[x].name
@@ -600,15 +627,6 @@ class VertexBufferGroup(object):
 
     def __len__(self):
         return len(self.vertices)
-
-    def merge_vbs(self, vbs):
-        self.vertices = self.vbs[0].vertices
-        del self.vbs[0].vertices
-        assert(len(self.vertices) == self.vertex_count)
-        for vb in self.vbs[1:]:
-            assert(len(vb.vertices) == self.vertex_count)
-            [ self.vertices[i].update(vertex) for i,vertex in enumerate(vb.vertices) ]
-            del vb.vertices
 
     def merge(self, other):
         if self.layout != other.layout:
@@ -692,7 +710,10 @@ class IndexBuffer(object):
                 break
             face.append(*self.decoder(index))
             if len(face) == 3:
-                self.faces.append(tuple(face))
+                # aman: reverse face index order so blender calculate backface correctly
+                # remember to reverse index back during export
+                face_inv=[face[2],face[1],face[0]]
+                self.faces.append(tuple(face_inv))
                 face = []
         assert(len(face) == 0)
 
@@ -739,7 +760,7 @@ def load_3dmigoto_mesh_bin(operator, vb_paths, ib_paths, pose_path):
     vb_bin_path, vb_txt_path = vb_paths[0]
     ib_bin_path, ib_txt_path = ib_paths[0]
 
-    vb = VertexBufferGroup(vb_txt_path, load_vertices=False)
+    vb = VertexBuffer(open(vb_txt_path, 'r'), load_vertices=False)
     vb.parse_vb_bin(open(vb_bin_path, 'rb'))
 
     ib = None
@@ -756,10 +777,10 @@ def load_3dmigoto_mesh(operator, paths):
     if use_bin[0]:
         return load_3dmigoto_mesh_bin(operator, vb_paths, ib_paths, pose_path)
 
-    vb = VertexBufferGroup(vb_paths[0])
+    vb = VertexBuffer(open(vb_paths[0], 'r'))
     # Merge additional vertex buffers for meshes split over multiple draw calls:
     for vb_path in vb_paths[1:]:
-        tmp = VertexBufferGroup(vb_path)
+        tmp = VertexBuffer(open(vb_path, 'r'))
         vb.merge(tmp)
 
     # For quickly testing how importent any unsupported semantics may be:
@@ -778,15 +799,15 @@ def load_3dmigoto_mesh(operator, paths):
             tmp = IndexBuffer(open(ib_path, 'r'))
             ib.merge(tmp)
 
-    return vb, ib, os.path.basename(vb_paths[0][0]), pose_path
+    return vb, ib, os.path.basename(vb_paths[0]), pose_path
 
 def import_normals_step1(mesh, data):
     # Ensure normals are 3-dimensional:
     # XXX: Assertion triggers in DOA6
-    if len(data[0]) == 4:
-        if [x[3] for x in data] != [0.0]*len(data):
-            raise Fatal('Normals are 4D')
-    normals = [(x[0], x[1], x[2]) for x in data]
+    #if len(data[0]) == 4:
+     #   if [x[3] for x in data] != [0.0]*len(data):
+      #      raise Fatal('Normals are 4D')
+    normals = [(x[0], x[1], x[2], x[3]) for x in data]
 
     # To make sure the normals don't get lost by Blender's edit mode,
     # or mesh.update() we need to set custom normals in the loops, not
@@ -945,13 +966,6 @@ def import_vertices(mesh, vb):
         if elem.InputSlotClass != 'per-vertex':
             continue
 
-        if elem.InputSlot not in vb.slots:
-            # UE4 known to proclaim it has attributes in all the slots in the
-            # layout description, but only ends up using two (and one of those
-            # is per-instance data)
-            print('NOTICE: Vertex semantic %s unavailable due to missing vb%i' % (elem.name, elem.InputSlot))
-            continue
-
         # TODO: Allow poorly named semantics to map to other meanings to be
         # properly interpreted. This still needs to be added to the GUI, and
         # mapped back on export. Alternatively, you can alter the input
@@ -1053,8 +1067,7 @@ def import_3dmigoto_vb_ib(operator, context, paths, flip_texcoord_v=True, axis_f
     # Attach the vertex buffer layout to the object for later exporting. Can't
     # seem to retrieve this if attached to the mesh - to_mesh() doesn't copy it:
     obj['3DMigoto:VBLayout'] = vb.layout.serialise()
-    for raw_vb in vb.vbs:
-        obj['3DMigoto:VB%iStride' % raw_vb.idx] = raw_vb.stride
+    obj['3DMigoto:VBStride'] = vb.layout.stride # FIXME: Strides of multiple vertex buffers
     obj['3DMigoto:FirstVertex'] = vb.first
 
     if ib is not None:
@@ -1135,12 +1148,17 @@ def blender_vertex_to_3dmigoto_vertex(mesh, obj, blender_loop_vertex, layout, te
                 vertex[elem.name] = list(mesh.vertex_colors[elem.name+'.RGB'].data[blender_loop_vertex.index].color)[:3] + \
                                         [mesh.vertex_colors[elem.name+'.A'].data[blender_loop_vertex.index].color[0]]
         elif elem.name == 'NORMAL':
+            # GoW: the 4th component is unused , it can be 0.
             vertex[elem.name] = elem.pad(list(blender_loop_vertex.normal), 0.0)
         elif elem.name.startswith('TANGENT'):
             # DOAXVV has +1/-1 in the 4th component. Not positive what this is,
             # but guessing maybe the bitangent sign? Not even sure it is used...
-            # FIXME: Other games
-            vertex[elem.name] = elem.pad(list(blender_loop_vertex.tangent), blender_loop_vertex.bitangent_sign)
+            # FIXME: Other games       
+            if blender_loop_vertex.bitangent_sign > 0: # GoW Trangent contains bi-tangent sign,
+                bitangent_sign = 3.0                  # mapping 1.0 to 3.0,  -1.0 to 0.0
+            else:
+                bitangent_sign = 0.0
+            vertex[elem.name] = elem.pad(list(blender_loop_vertex.tangent), bitangent_sign) 
         elif elem.name.startswith('BINORMAL'):
             # Some DOA6 meshes (skirts) use BINORMAL, but I'm not certain it is
             # actually the binormal. These meshes are weird though, since they
@@ -1186,7 +1204,6 @@ def blender_vertex_to_3dmigoto_vertex(mesh, obj, blender_loop_vertex, layout, te
             print('NOTICE: Unhandled vertex element: %s' % elem.name)
         #else:
         #    print('%s: %s' % (elem.name, repr(vertex[elem.name])))
-
     return vertex
 
 def write_fmt_file(f, vb, ib):
@@ -1202,7 +1219,6 @@ def export_3dmigoto(operator, context, vb_path, ib_path, fmt_path):
     if obj is None:
         raise Fatal('No object selected')
 
-    # FIXME: Per-vertex buffer strides
     stride = obj['3DMigoto:VBStride']
     layout = InputLayout(obj['3DMigoto:VBLayout'], stride=stride)
     if hasattr(context, "evaluated_depsgraph_get"): # 2.80
@@ -1257,9 +1273,10 @@ def export_3dmigoto(operator, context, vb_path, ib_path, fmt_path):
             vertex = blender_vertex_to_3dmigoto_vertex(mesh, obj, blender_lvertex, layout, texcoord_layers)
             face.append(indexed_vertices.setdefault(HashableVertex(vertex), len(indexed_vertices)))
         if ib is not None:
-            ib.append(face)
+            face_inv = [face[2],face[1],face[0]]  # inverse face loop, GoW game face normal is opposite of Blender.
+            ib.append(face_inv)    
 
-    vb = VertexBufferGroup(layout=layout)
+    vb = VertexBuffer(layout=layout)
     for vertex in indexed_vertices:
         vb.append(vertex)
 
@@ -1402,9 +1419,9 @@ class Import3DMigotoFrameAnalysis(bpy.types.Operator, ImportHelper, IOOBJOrienta
                 except IndexError:
                     pass
 
-            if len(ib_paths) != 1:
-                raise Fatal('Error: excess index buffers in dump?')
-            ret.add((tuple(vb_paths), ib_paths[0], use_bin, pose_path))
+            if len(ib_paths) != 1 or len(vb_paths) != 1:
+                raise Fatal('Only draw calls using a single vertex buffer and a single index buffer are supported for now')
+            ret.add((vb_paths[0], ib_paths[0], use_bin, pose_path))
         return ret
 
     def execute(self, context):
@@ -1426,7 +1443,7 @@ class Import3DMigotoFrameAnalysis(bpy.types.Operator, ImportHelper, IOOBJOrienta
         return {'FINISHED'}
 
 def import_3dmigoto_raw_buffers(operator, context, vb_fmt_path, ib_fmt_path, vb_path=None, ib_path=None, vgmap_path=None, **kwargs):
-    paths = ((((vb_path, vb_fmt_path),), (ib_path, ib_fmt_path), True, None),)
+    paths = (((vb_path, vb_fmt_path), (ib_path, ib_fmt_path), True, None),)
     obj = import_3dmigoto(operator, context, paths, merge_meshes=False, **kwargs)
     if obj and vgmap_path:
         apply_vgmap(operator, context, targets=obj, filepath=vgmap_path, rename=True, cleanup=True)
