@@ -10,5 +10,5 @@ Expands on DarkStarSword's Blender add-on, 3DMigoto Frame analysis dump with Mul
 -  Add a "Flip Face" check box to import dialog for game mesh that shows inside out in Blender. Export mesh will reverse this action.
 -  Original Add-on can import Frame analysis dump that with multiple VBs  (one ib.txt  with multiple *-vb[n].txt and *-vb[n].buf). 
 -  Add support for exporting Multi-VBs mesh as raw buffers, create multiple *-vb[n].vb files, each with its corresponding *-vb[n].fmt file. 
--  Exception: If all VBs in a multi-VBs mesh have the same layout and stride size. it will be exported as one single .vb with one .fmt file insteads.
--  3DMigoto raw buffer import (.vb + .ib ) search for mulitple -vb[n].fmt files and import the .ib with *-vb[n].vb files.   
+-  Exception: If all VBs in a multi-VBs mesh have the same layout and stride size. it will be exported as one single .vb with one .fmt file.
+-  3DMigoto raw buffer import (.vb + .ib ) search for mulitple -vb[n].fmt files and import the .ib with associated *-vb[n].vb files.   
