@@ -1,0 +1,14 @@
+# 3d-fixes
+Expands on DarkStarSword's Blender Add-on, 3DMigoto Frame analysis dump with Multi-VB export and Multi-games support
+
+- Add a "VB Format" drop down list to 3DMigoto Frame Analysis dump (vb.txt + ib.txt) import dialog which support game specific VB format.
+- VB Formats are defined in a dictionary in code: Supports conversion of mis-labelled dump element names and formats to the correct values. 
+- 3 game VB formats are defined:
+-       God of War 2018    -> lightly tested
+-       State of Decay 2   -> has a unkown element "ATTRIBUTE13", exported mult-VB mesh has a deformed black shadow
+-       FFVII Remake       -> untested  
+-  Add a "Flip Face" check box to import dialog for games that needs their mesh face revese for Blender.
+-  Original Add-on can import Frame analysis dump that with multiple VBs  (one ib.txt  with multiple *-vb[n].txt and *-vb[n].buf). 
+-  Add support for exporting Multi-VBs mesh as raw buffers, create multiple *-vb[n].vb files, each with its corresponding *-vb[*].fmt file. 
+-  Exception: If all VBs in a multi-VBs mesh have the same layout and stride size. it will be exported as one single .vb with one .fmt file insteads.
+-  3DMigoto raw buffer import (.vb + .ib ) search for mulitple -vb[n].fmt files and import the .ib with *-vb[n].vb files.   
