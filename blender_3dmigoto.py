@@ -173,6 +173,7 @@ s8_pattern = re.compile(r'''(?:DXGI_FORMAT_)?(?:[RGBAD]8)+_SINT''')
 unorm16_pattern = re.compile(r'''(?:DXGI_FORMAT_)?(?:[RGBAD]16)+_UNORM''')
 unorm8_pattern = re.compile(r'''(?:DXGI_FORMAT_)?(?:[RGBAD]8)+_UNORM''')
 unorm10a2_pattern = re.compile(r'''(?:DXGI_FORMAT_)?(?:[RGB]10)+A2_UNORM''')
+snorm10a2_pattern = re.compile(r'''(?:DXGI_FORMAT_)?(?:[RGB]10)+A2_SNORM''')
 snorm16_pattern = re.compile(r'''(?:DXGI_FORMAT_)?(?:[RGBAD]16)+_SNORM''')
 snorm8_pattern = re.compile(r'''(?:DXGI_FORMAT_)?(?:[RGBAD]8)+_SNORM''')
 
@@ -213,15 +214,38 @@ def EncoderDecoder(fmt):
                 lambda data: (numpy.frombuffer(data, numpy.uint8) / 255.0).tolist())
     if unorm10a2_pattern.match(fmt):
         return (pack_unorm10a2, unpack_unorm10a2)
+    if snorm10a2_pattern.match(fmt):
+        return (pack_snorm10a2, unpack_snorm10a2)		
     if snorm16_pattern.match(fmt):
         return (lambda data: numpy.around((numpy.fromiter(data, numpy.float32) * 32767.0)).astype(numpy.int16).tobytes(),
                 lambda data: (numpy.frombuffer(data, numpy.int16) / 32767.0).tolist())
     if snorm8_pattern.match(fmt):
-        return (lambda data: numpy.around((numpy.fromiter(data, numpy.float32) * 127.0)).astype(numpy.int8).tobytes(),
-                lambda data: (numpy.frombuffer(data, numpy.int8) / 127.0).tolist())
+        return (lambda data: numpy.around((numpy.fromiter(data, numpy.float32)+1.0) * 127.5).astype(numpy.uint8).tobytes(),
+                lambda data: (numpy.frombuffer(data, numpy.uint8) / 127.5 - 1.0).tolist())
 
     raise Fatal('File uses an unsupported DXGI Format: %s' % fmt)
 
+def pack_snorm10a2(components):
+    r, g, b = numpy.around((numpy.fromiter(components[0:3], numpy.float32) + 1.0) * 511.5).astype(numpy.uint32).tolist()
+    a,      = numpy.around( numpy.fromiter(components[3:4], numpy.float32) * 3.0).astype(numpy.uint32).tolist()
+    rgb_mask = 0b1111111111 # 10-bit mask
+    value  = ( r & rgb_mask       )
+    value |= ((g & rgb_mask) << 10)
+    value |= ((b & rgb_mask) << 20)
+    value |= ((a &     0b11) << 30)
+    return numpy.fromiter([value], numpy.uint32).tobytes()
+
+def unpack_snorm10a2(data):
+    value, = numpy.frombuffer(data, numpy.uint32).tolist()
+    rgb_mask = 0b1111111111 # 10-bit mask
+    r = ( value        & rgb_mask)
+    g = ((value >> 10) & rgb_mask)
+    b = ((value >> 20) & rgb_mask)
+    a = ( value >> 30            ) # 2-bit alpha
+    r, g, b = (numpy.fromiter([r, g, b], numpy.uint32) / 511.5 - 1.0).astype(numpy.float32).tolist()
+    a,      = (numpy.fromiter([a      ], numpy.uint32) / 3.0).astype(numpy.float32).tolist()
+    return [r, g, b, a]
+ 
 def pack_unorm10a2(components):
     r, g, b = numpy.around(numpy.fromiter(components[0:3], numpy.float32) * 1023.0).astype(numpy.uint32).tolist()
     a,      = numpy.around(numpy.fromiter(components[3:4], numpy.float32) *    3.0).astype(numpy.uint32).tolist()
@@ -251,8 +275,59 @@ def format_size(fmt):
     matches = components_pattern.findall(fmt)
     return sum(map(int, matches)) // 8
 
+class Enum(tuple): __getattr__ = tuple.index
+opt= Enum([
+    'Flip_Face', # reverse face vertex order for Blender 
+    'Normal_BiTanSign', # Normal vector has Bitangent sign
+    'Tangent_BiTanSign' # Tangent vector has Bitngent sign
+    ])
+
+# Game VB Format Dictionay
+VBFormatDB ={
+    'DEFAULT': ('Default', {}, {opt.Tangent_BiTanSign} ),    # default do nothing     
+    'SOD2': ( 'State of Decay 2',
+        {
+            'ATTRIBUTE1': ('TANGENT','R8G8B8A8_SNORM'), # convert name and format,3DMigoto think it was 'UNORM'
+            'ATTRIBUTE2': ('NORMAL','R8G8B8A8_SNORM'), 
+            'ATTRIBUTE3': ('BLENDINDICES',''),  # only name translation
+            'ATTRIBUTE4': ('BLENDWEIGHT',''), 
+            'ATTRIBUTE' : ('POSITION',''), 
+            'ATTRIBUTE5': ('TEXCOORD1',''), 
+            'ATTRIBUTE6': ('TEXCOORD2',''), 
+            'ATTRIBUTE8': ('TEXCOORD3',''), 
+            'ATTRIBUTE7': ('TEXCOORD4',''),        
+        }, {opt.Flip_Face, opt.Normal_BiTanSign} # flip face and put biTangnt sign in normmal
+    ),
+   'GOW2018' : ( 'God of War 2018', 
+        {
+            'NORMAL': ('NORMAL', 'R10G10B10A2_SNORM'), # no name conversion, but normal and tangent need to be 'SNORM'
+            'TANGENT': ('TANGENT', 'R10G10B10A2_SNORM'),
+        },  {opt.Flip_Face, opt.Tangent_BiTanSign}
+    ),
+
+    'FF7R' : ( 'FFVII Remake',
+        {
+            'ATTRIBUTE1': ('NORMAL', ''),# FF7R  Untested
+            'ATTRIBUTE2': ('TANGENT',''), # FF7R
+            'ATTRIBUTE':  ('POSITION',''), # FF7R
+            'ATTRIBUTE5': ('TEXCOORD1',''), # FF7R
+            'ATTRIBUTE6': ('TEXCOORD2',''), # FF7R
+            'ATTRIBUTE7': ('TEXCOORD3',''), # FF7R
+            'ATTRIBUTE8': ('TEXCOORD4','') # FF7R     
+        }, {opt.Tangent_BiTanSign}
+    )
+}
+g_vbformat = 'DEFAULT'
+
+def translate_semantic(elem_name):
+    global g_vbformat
+    translated_tuple= VBFormatDB[g_vbformat][1].get(elem_name, (elem_name,''))
+    return translated_tuple[0]
+
 class InputLayoutElement(object):
     def __init__(self, arg):
+        self.orig_format = '' # Original format from 3DMigoto dump
+
         if isinstance(arg, io.IOBase):
             self.from_file(arg)
         else:
@@ -260,10 +335,25 @@ class InputLayoutElement(object):
 
         self.encoder, self.decoder = EncoderDecoder(self.Format)
 
+    def format_override(self, format):
+        global g_vbformat
+        if self.SemanticIndex:
+            raw_name= '%s%i' % (self.SemanticName, self.SemanticIndex)
+        else:
+            raw_name = self.SemanticName
+
+        new_format = VBFormatDB[g_vbformat][1].get(raw_name, (raw_name,''))[1]
+        if new_format != '':
+            self.orig_format = format # save old format
+            self.orig_encoder, self.orig_decoder = EncoderDecoder(format)
+            return new_format
+        else:
+            return format
+
     def from_file(self, f):
         self.SemanticName = self.next_validate(f, 'SemanticName')
         self.SemanticIndex = int(self.next_validate(f, 'SemanticIndex'))
-        self.Format = self.next_validate(f, 'Format')
+        self.Format = self.format_override(self.next_validate(f, 'Format'))
         self.InputSlot = int(self.next_validate(f, 'InputSlot'))
         self.AlignedByteOffset = self.next_validate(f, 'AlignedByteOffset')
         if self.AlignedByteOffset == 'append':
@@ -293,7 +383,7 @@ class InputLayoutElement(object):
             InputSlotClass: %s
             InstanceDataStepRate: %i
         ''').lstrip() % (
-            self.SemanticName,
+            self.name,     #self.SemanticName,
             self.SemanticIndex,
             self.Format,
             self.InputSlot,
@@ -320,8 +410,10 @@ class InputLayoutElement(object):
     @property
     def name(self):
         if self.SemanticIndex:
-            return '%s%i' % (self.SemanticName, self.SemanticIndex)
-        return self.SemanticName
+            raw_name= '%s%i' % (self.SemanticName, self.SemanticIndex)
+        else:
+            raw_name = self.SemanticName
+        return translate_semantic(raw_name)
 
     def pad(self, data, val):
         padding = format_components(self.Format) - len(data)
@@ -358,8 +450,10 @@ class InputLayoutElement(object):
             self.InstanceDataStepRate == other.InstanceDataStepRate
 
 class InputLayout(object):
-    def __init__(self, custom_prop=[]):
+    def __init__(self, custom_prop=[], stride=0, slot=0):
         self.elems = collections.OrderedDict()
+        self.stride = stride
+        self.slot = slot            # related vb files do not share layout, due to different stride and active slot.
         for item in custom_prop:
             elem = InputLayoutElement(item)
             self.elems[elem.name] = elem
@@ -384,28 +478,29 @@ class InputLayout(object):
     def __getitem__(self, semantic):
         return self.elems[semantic]
 
-    def encode(self, vertex, stride):
-        buf = bytearray(stride)
+    def encode(self, vertex):
+        buf = bytearray(self.stride)
 
         for semantic, data in vertex.items():
             if semantic.startswith('~'):
                 continue
             elem = self.elems[semantic]
-            data = elem.encode(data)
-            buf[elem.AlignedByteOffset:elem.AlignedByteOffset + len(data)] = data
-
-        assert(len(buf) == stride)
+            if elem.InputSlot == self.slot: # only export element that belong to current vb#
+                data = elem.encode(data)            
+                buf[elem.AlignedByteOffset:elem.AlignedByteOffset + len(data)] = data
+        assert(len(buf) == self.stride)
         return buf
 
     def decode(self, buf):
         vertex = {}
         for elem in self.elems.values():
-            data = buf[elem.AlignedByteOffset:elem.AlignedByteOffset + elem.size()]
-            vertex[elem.name] = elem.decode(data)
+            if elem.InputSlot == self.slot:   # only decode element in slot that belong to current vb#
+                data = buf[elem.AlignedByteOffset:elem.AlignedByteOffset + elem.size()]
+                vertex[elem.name] = elem.decode(data) 
         return vertex
 
     def __eq__(self, other):
-        return self.elems == other.elems
+        return self.elems == other.elems and self.stride == other.stride #  stride is part of layout data for multi vb support
 
 class HashableVertex(dict):
     def __hash__(self):
@@ -424,7 +519,7 @@ class IndividualVertexBuffer(object):
 
     def __init__(self, idx, f=None, layout=None, load_vertices=True):
         self.vertices = []
-        self.layout = layout and layout or InputLayout()
+        self.layout = layout and layout or InputLayout(slot=idx)
         self.first = 0
         self.vertex_count = 0
         self.offset = 0
@@ -445,7 +540,7 @@ class IndividualVertexBuffer(object):
             if line.startswith('vertex count:'):
                 self.vertex_count = int(line[14:])
             if line.startswith('stride:'):
-                self.stride = int(line[7:])
+                self.layout.stride = int(line[7:])
             if line.startswith('element['):
                 self.layout.parse_element(f)
             if line.startswith('topology:'):
@@ -493,7 +588,7 @@ class IndividualVertexBuffer(object):
 
             match = self.vb_elem_pattern.match(line)
             if match:
-                vertex[match.group('semantic')] = self.parse_vertex_element(match)
+                vertex[translate_semantic(match.group('semantic'))] = self.parse_vertex_element(match)
             elif line == '' and vertex:
                 self.vertices.append(vertex)
                 vertex = {}
@@ -502,8 +597,19 @@ class IndividualVertexBuffer(object):
 
     def parse_vertex_element(self, match):
         fields = match.group('data').split(',')
-
-        format = self.layout[match.group('semantic')].Format
+        
+        elem = self.layout[translate_semantic(match.group('semantic'))]
+        orig_format = elem.orig_format
+        if orig_format != '':  # format was replaced
+            # text vertex data already been decoded, encode back to bytes and decode with new format   
+            if orig_format.endswith('R10G10B10A2_UNORM'):
+                data = bytearray.fromhex(fields[0])
+            elif orig_format.endswith('INT'):
+                data = elem.orig_encoder(tuple(map(int, fields)))
+            else:
+                data = elem.orig_encoder(tuple(map(float, fields)))
+            return elem.decode(data)   # decode with new format decoder            
+        format = self.layout[translate_semantic(match.group('semantic'))].Format
         # R10G10B10A2_UNORM values are written as a single hex string, so it
         # must be converted to bytearray before unpacking.
         if format.endswith('R10G10B10A2_UNORM'):
@@ -539,26 +645,32 @@ class VertexBufferGroup(object):
         for f in files:
             match = self.vb_idx_pattern.search(f)
             if match is None:
-                raise Fatal('Cannot determine vertex buffer index from filename %s' % f)
-            idx = int(match.group(1))
-            vb = IndividualVertexBuffer(idx, open(f, 'r'), self.layout, load_vertices)
-            if vb.vertices:
-                self.vbs.append(vb)
-                self.slots.add(idx)
+                idx = 0  # if vb have no id, it is a standalone vb
+            	#raise Fatal('Cannot determine vertex buffer index from filename %s' % f)
+            else:
+                idx = int(match.group(1))
+            vb = IndividualVertexBuffer(idx, open(f, 'r'), None, load_vertices)  # should not share layout, each vb have different stride and slot           
 
+            self.vbs.append(vb)  # prepare vb array, parse_vb_bin add vertex data to them
+            self.slots.add(idx)
+            
+        if load_vertices:
+            self.update_vb_group()
+
+    def parse_vb_bin(self, files):  # parse_vb_txt must be done before calling this
+        for f , vb in zip(files, self.vbs):
+            vb.parse_vb_bin(open(f,'rb'))  # fill in the vertex data  
+        self.update_vb_group()
+
+    def update_vb_group(self):
         # Non buffer specific info:
         self.first = self.vbs[0].first
         self.vertex_count = self.vbs[0].vertex_count
-        self.topology = self.vbs[0].topology
-
-        if load_vertices:
-            self.merge_vbs(self.vbs)
-            assert(len(self.vertices) == self.vertex_count)
-
-    def parse_vb_bin(self, files):
-        # FIXME TODO
-        pass
-
+        self.topology = self.vbs[0].topology            
+        self.merge_vbs(self.vbs)
+        assert(len(self.vertices) == self.vertex_count)
+        self.layout = self.vbs[0].layout # since layout is not shared, copy the first VB layout to VB group.
+        
     def append(self, vertex):
         self.vertices.append(vertex)
         self.vertex_count += 1
@@ -598,6 +710,27 @@ class VertexBufferGroup(object):
         else:
             print(msg)
 
+    def write_group(self, vb_path, vbs_layouts, operator=None):
+        if all([ self.layout == s_layout for s_layout in vbs_layouts ]):
+            # export just one vb if all vbs in group has the same layout
+            # there is no need to break it into many vb.
+            output=open(vb_path,'wb')
+            for vertex in self.vertices:
+                output.write(self.layout.encode(vertex))
+        else:
+            idx = 0
+            for s_layout in vbs_layouts:
+                vb_single=vb_path.replace('.vb','-vb'+str(idx)+'.vb')
+                idx = idx + 1
+                output=open(vb_single,'wb')
+                for vertex in self.vertices:
+                    output.write(s_layout.encode(vertex))
+        msg = 'Wrote %i vertices to %s' % (len(self), output.name)
+        if operator:
+            operator.report({'INFO'}, msg)
+        else:
+            print(msg)
+ 
     def __len__(self):
         return len(self.vertices)
 
@@ -736,18 +869,18 @@ def load_3dmigoto_mesh_bin(operator, vb_paths, ib_paths, pose_path):
 
     # Loading from binary files, but still need to use the .txt files as a
     # reference for the format:
-    vb_bin_path, vb_txt_path = vb_paths[0]
-    ib_bin_path, ib_txt_path = ib_paths[0]
+    vb_bin_path, vb_txt_path = zip(*(vb_paths[0]))  # vb_paths[0] is a list of tuple(bin_path, txt_path), split them in two list
+    ib_bin_path, ib_txt_path = ib_paths[0]          # ib_path[0] is just a single tuple(bin,txt_path)
 
     vb = VertexBufferGroup(vb_txt_path, load_vertices=False)
-    vb.parse_vb_bin(open(vb_bin_path, 'rb'))
+    vb.parse_vb_bin(vb_bin_path)
 
     ib = None
     if ib_paths:
         ib = IndexBuffer(open(ib_txt_path, 'r'), load_indices=False)
         ib.parse_ib_bin(open(ib_bin_path, 'rb'))
 
-    return vb, ib, os.path.basename(vb_bin_path), pose_path
+    return vb, ib, os.path.basename(vb_bin_path[0]), pose_path
 
 def load_3dmigoto_mesh(operator, paths):
     vb_paths, ib_paths, use_bin, pose_path = zip(*paths)
@@ -783,10 +916,10 @@ def load_3dmigoto_mesh(operator, paths):
 def import_normals_step1(mesh, data):
     # Ensure normals are 3-dimensional:
     # XXX: Assertion triggers in DOA6
-    if len(data[0]) == 4:
-        if [x[3] for x in data] != [0.0]*len(data):
-            raise Fatal('Normals are 4D')
-    normals = [(x[0], x[1], x[2]) for x in data]
+    #if len(data[0]) == 4:
+    #    if [x[3] for x in data] != [0.0]*len(data):
+    #        raise Fatal('Normals are 4D')
+    normals = [(x[0], x[1], x[2], x[3]) for x in data]
 
     # To make sure the normals don't get lost by Blender's edit mode,
     # or mesh.update() we need to set custom normals in the loops, not
@@ -830,11 +963,17 @@ def import_vertex_groups(mesh, obj, blend_indices, blend_weights):
         for i in range(num_vertex_groups):
             obj.vertex_groups.new(name=str(i))
         for vertex in mesh.vertices:
-            for semantic_index in sorted(blend_indices.keys()):
-                for i, w in zip(blend_indices[semantic_index][vertex.index], blend_weights[semantic_index][vertex.index]):
-                    if w == 0.0:
+            bi_first_si = list(blend_indices.keys())[0] # blend_indices semantic_index could differ from blend_weights' semantic_index
+            bw_first_si = list(blend_weights.keys())[0] # Don't expect there are more than one set of indices and weight anyway
+            totalw = 0.0
+            for i, w in zip(blend_indices[bi_first_si][vertex.index], blend_weights[bw_first_si][vertex.index]):
+                if w == 0.0:
+                    if totalw < 1.0:
+                        w = 1.0 - totalw  #  make sure there is no missing weight
+                    else:
                         continue
-                    obj.vertex_groups[i].add((vertex.index,), w, 'REPLACE')
+                totalw = totalw + w  
+                obj.vertex_groups[i].add((vertex.index,), w, 'REPLACE')
 def import_uv_layers(mesh, obj, texcoords, flip_texcoord_v):
     for (texcoord, data) in sorted(texcoords.items()):
         # TEXCOORDS can have up to four components, but UVs can only have two
@@ -851,7 +990,7 @@ def import_uv_layers(mesh, obj, texcoords, flip_texcoord_v):
         cmap = {'x': 0, 'y': 1, 'z': 2, 'w': 3}
 
         for components in components_list:
-            uv_name = 'TEXCOORD%s.%s' % (texcoord and texcoord or '', components)
+            uv_name = '%s.%s' % (texcoord and texcoord or '', components)
             if hasattr(mesh, 'uv_textures'): # 2.79
                 mesh.uv_textures.new(uv_name)
             else: # 2.80
@@ -1021,7 +1160,7 @@ def import_vertices(mesh, vb):
         elif translated_elem_name.startswith('BLENDWEIGHT'):
             blend_weights[elem.SemanticIndex] = data
         elif translated_elem_name.startswith('TEXCOORD') and elem.is_float():
-            texcoords[elem.SemanticIndex] = data
+            texcoords[translated_elem_name] = data
         else:
             print('NOTICE: Storing unhandled semantic %s %s as vertex layer' % (elem.name, elem.Format))
             vertex_layers[elem.name] = data
@@ -1041,7 +1180,7 @@ def import_3dmigoto(operator, context, paths, merge_meshes=True, **kwargs):
         # FIXME: Group objects together
         return obj
 
-def import_3dmigoto_vb_ib(operator, context, paths, flip_texcoord_v=True, axis_forward='-Z', axis_up='Y', pose_cb_off=[0,0], pose_cb_step=1):
+def import_3dmigoto_vb_ib(operator, context, paths, vbuf_format='DEFAULT', flip_face=False, flip_texcoord_v=True, axis_forward='-Z', axis_up='Y', pose_cb_off=[0,0], pose_cb_step=1):
     vb, ib, name, pose_path = load_3dmigoto_mesh(operator, paths)
 
     mesh = bpy.data.meshes.new(name)
@@ -1053,11 +1192,22 @@ def import_3dmigoto_vb_ib(operator, context, paths, flip_texcoord_v=True, axis_f
     # Attach the vertex buffer layout to the object for later exporting. Can't
     # seem to retrieve this if attached to the mesh - to_mesh() doesn't copy it:
     obj['3DMigoto:VBLayout'] = vb.layout.serialise()
-    for raw_vb in vb.vbs:
-        obj['3DMigoto:VB%iStride' % raw_vb.idx] = raw_vb.stride
+    obj['3DMigoto:VBStride'] = vb.layout.stride
     obj['3DMigoto:FirstVertex'] = vb.first
-
+    obj['3DMigoto:VBForamt'] = vbuf_format
+    obj['3DMigoto:FlipFace'] = flip_face
+ 
+    obj['3DMigoto:VBCount'] = len(vb.vbs)   
+    if vb:
+        for raw_vb in vb.vbs:
+            obj['3DMigoto:VBLayout%d' % raw_vb.idx] = raw_vb.layout.serialise()
+            obj['3DMigoto:VBStride%d' % raw_vb.idx] = raw_vb.layout.stride       
+    
     if ib is not None:
+        if flip_face:   
+            for i,f in enumerate(ib.faces): # flip all faces
+                ib.faces[i]= (f[2], f[1], f[0])
+    
         import_faces_from_ib(mesh, ib)
         # Attach the index buffer layout to the object for later exporting.
         obj['3DMigoto:IBFormat'] = ib.format
@@ -1105,10 +1255,13 @@ def mesh_triangulate(me):
     bm.to_mesh(me)
     bm.free()
 
-def blender_vertex_to_3dmigoto_vertex(mesh, obj, blender_loop_vertex, layout, texcoords):
+def blender_vertex_to_3dmigoto_vertex(mesh, obj, blender_loop_vertex, layout, texcoords, vb_opts):
     blender_vertex = mesh.vertices[blender_loop_vertex.vertex_index]
     vertex = {}
     seen_offsets = set()
+
+    normal_has_sign = opt.Normal_BiTanSign in vb_opts
+    tangent_has_sign = opt.Tangent_BiTanSign in vb_opts
 
     # TODO: Warn if vertex is in too many vertex groups for this layout,
     # ignoring groups with weight=0.0
@@ -1135,12 +1288,12 @@ def blender_vertex_to_3dmigoto_vertex(mesh, obj, blender_loop_vertex, layout, te
                 vertex[elem.name] = list(mesh.vertex_colors[elem.name+'.RGB'].data[blender_loop_vertex.index].color)[:3] + \
                                         [mesh.vertex_colors[elem.name+'.A'].data[blender_loop_vertex.index].color[0]]
         elif elem.name == 'NORMAL':
-            vertex[elem.name] = elem.pad(list(blender_loop_vertex.normal), 0.0)
+            vertex[elem.name] = elem.pad(list(blender_loop_vertex.normal), blender_loop_vertex.bitangent_sign if normal_has_sign else 0.0 )
         elif elem.name.startswith('TANGENT'):
             # DOAXVV has +1/-1 in the 4th component. Not positive what this is,
             # but guessing maybe the bitangent sign? Not even sure it is used...
-            # FIXME: Other games
-            vertex[elem.name] = elem.pad(list(blender_loop_vertex.tangent), blender_loop_vertex.bitangent_sign)
+            # FIXME: Other games            
+            vertex[elem.name] = elem.pad(list(blender_loop_vertex.tangent), blender_loop_vertex.bitangent_sign if tangent_has_sign else 0.0 )
         elif elem.name.startswith('BINORMAL'):
             # Some DOA6 meshes (skirts) use BINORMAL, but I'm not certain it is
             # actually the binormal. These meshes are weird though, since they
@@ -1156,11 +1309,13 @@ def blender_vertex_to_3dmigoto_vertex(mesh, obj, blender_loop_vertex, layout, te
             # vertex[elem.name] = elem.pad(list(binormal), 0.0)
             pass
         elif elem.name.startswith('BLENDINDICES'):
-            i = elem.SemanticIndex * 4
+            #i = elem.SemanticIndex * 4  
+            i = 0
             vertex[elem.name] = elem.pad([ x.group for x in vertex_groups[i:i+4] ], 0)
         elif elem.name.startswith('BLENDWEIGHT'):
             # TODO: Warn if vertex is in too many vertex groups for this layout
-            i = elem.SemanticIndex * 4
+            #i = elem.SemanticIndex * 4  
+            i = 0
             vertex[elem.name] = elem.pad([ x.weight for x in vertex_groups[i:i+4] ], 0.0)
         elif elem.name.startswith('TEXCOORD') and elem.is_float():
             # FIXME: Handle texcoords of other dimensions
@@ -1196,6 +1351,28 @@ def write_fmt_file(f, vb, ib):
         f.write('format: %s\n' % ib.format)
     f.write(vb.layout.to_string())
 
+def write_fmt_file_group(fmt_path, vbs_layout, vb, ib):
+
+    if all([ vb.layout == s_layout for s_layout in vbs_layout ]):
+        # export just one fmt if all vbs in group has the same layout
+        f=open(fmt_path,'w')
+        f.write('stride: %i\n' % vb.layout.stride)
+        f.write('topology: %s\n' % vb.topology)
+        if ib is not None:
+            f.write('format: %s\n' % ib.format)
+        f.write(vb.layout.to_string())    
+    else:
+        idx = 0
+        for s_layout in vbs_layout:
+            vb_single=fmt_path.replace('.fmt','-vb'+str(idx)+'.fmt')
+            idx = idx + 1
+            f=open(vb_single,'w')
+            f.write('stride: %i\n' % s_layout.stride)
+            f.write('topology: %s\n' % vb.topology)
+            if ib is not None:
+                f.write('format: %s\n' % ib.format)
+            f.write(s_layout.to_string())    
+
 def export_3dmigoto(operator, context, vb_path, ib_path, fmt_path):
     obj = context.object
 
@@ -1205,6 +1382,17 @@ def export_3dmigoto(operator, context, vb_path, ib_path, fmt_path):
     # FIXME: Per-vertex buffer strides
     stride = obj['3DMigoto:VBStride']
     layout = InputLayout(obj['3DMigoto:VBLayout'], stride=stride)
+    vbuf_format = obj['3DMigoto:VBForamt']
+    
+    global g_vbformat
+    g_vbformat = vbuf_format
+ 
+    vbs_count = obj['3DMigoto:VBCount'] 
+    vbs_layout = []   
+    for idx in range(vbs_count):
+        raw_stride = obj['3DMigoto:VBStride%d' % idx] # recover strides and layouts 
+        vbs_layout.append(InputLayout(obj['3DMigoto:VBLayout%d' % idx],stride=raw_stride, slot=idx))
+
     if hasattr(context, "evaluated_depsgraph_get"): # 2.80
         mesh = obj.evaluated_get(context.evaluated_depsgraph_get()).to_mesh()
     else: # 2.79
@@ -1242,7 +1430,9 @@ def export_3dmigoto(operator, context, vb_path, ib_path, fmt_path):
             uv = flip_uv(uv_layer.data[l.index].uv)
             texcoords[l.index] = uv
         texcoord_layers[uv_layer.name] = texcoords
-
+    
+    flip_face = obj['3DMigoto:FlipFace']
+    vb_opts =  VBFormatDB[vbuf_format][2]  
     # Blender's vertices have unique positions, but may have multiple
     # normals, tangents, UV coordinates, etc - these are stored in the
     # loops. To export back to DX we need these combined together such that
@@ -1254,9 +1444,11 @@ def export_3dmigoto(operator, context, vb_path, ib_path, fmt_path):
     for poly in mesh.polygons:
         face = []
         for blender_lvertex in mesh.loops[poly.loop_start:poly.loop_start + poly.loop_total]:
-            vertex = blender_vertex_to_3dmigoto_vertex(mesh, obj, blender_lvertex, layout, texcoord_layers)
+            vertex = blender_vertex_to_3dmigoto_vertex(mesh, obj, blender_lvertex, layout, texcoord_layers, vb_opts)
             face.append(indexed_vertices.setdefault(HashableVertex(vertex), len(indexed_vertices)))
         if ib is not None:
+            if flip_face: 
+                face = [face[2],face[1],face[0]]
             ib.append(face)
 
     vb = VertexBufferGroup(layout=layout)
@@ -1266,7 +1458,8 @@ def export_3dmigoto(operator, context, vb_path, ib_path, fmt_path):
     vgmaps = {k[15:]:keys_to_ints(v) for k,v in obj.items() if k.startswith('3DMigoto:VGMap:')}
 
     if '' not in vgmaps:
-        vb.write(open(vb_path, 'wb'), operator=operator)
+        vb.write_group(vb_path, vbs_layout, operator=operator)
+        #vb.write(open(vb_path, 'wb'), operator=operator)
 
     base, ext = os.path.splitext(vb_path)
     for (suffix, vgmap) in vgmaps.items():
@@ -1285,7 +1478,8 @@ def export_3dmigoto(operator, context, vb_path, ib_path, fmt_path):
         ib.write(open(ib_path, 'wb'), operator=operator)
 
     # Write format reference file
-    write_fmt_file(open(fmt_path, 'w'), vb, ib)
+    #write_fmt_file(open(fmt_path, 'w'), vb, ib)
+    write_fmt_file_group(fmt_path, vbs_layout, vb, ib)
 
 @orientation_helper(axis_forward='-Z', axis_up='Y')
 class Import3DMigotoFrameAnalysis(bpy.types.Operator, ImportHelper, IOOBJOrientationHelper):
@@ -1305,6 +1499,31 @@ class Import3DMigotoFrameAnalysis(bpy.types.Operator, ImportHelper, IOOBJOrienta
             type=bpy.types.OperatorFileListElement,
             )
 
+    comboItems = []   #Propulate  VF Format drop list
+    for gameID in VBFormatDB.keys():
+        comboItems.append((gameID,VBFormatDB[gameID][0],""))
+
+    def comboCanged(self, context):
+        global g_vbformat
+        g_vbformat = self.vbuf_format
+        vb_opts =  VBFormatDB[self.vbuf_format][2]    
+        self.flip_face = opt.Flip_Face in vb_opts 
+        #print("change to: ", self.vbuf_format)
+
+    vbuf_format = bpy.props.EnumProperty(
+        items=comboItems,
+        name="VBUF Format",
+        description="Game specific buffer processing",
+        default="DEFAULT",
+        update=comboCanged
+             )
+
+    flip_face = BoolProperty(
+            name="Flip face direction",
+            description="Reverse face loop vertex order",
+            default=False,
+            )
+    
     flip_texcoord_v = BoolProperty(
             name="Flip TEXCOORD V",
             description="Flip TEXCOORD V asix during importing",
@@ -1450,6 +1669,12 @@ class Import3DMigotoRaw(bpy.types.Operator, ImportHelper, IOOBJOrientationHelper
             type=bpy.types.OperatorFileListElement,
             )
 
+    flip_face = BoolProperty(
+            name="Flip face direction",
+            description="Reverse face loop vertex order",
+            default=False,
+            )
+    
     flip_texcoord_v = BoolProperty(
             name="Flip TEXCOORD V",
             description="Flip TEXCOORD V asix during importing",
@@ -1483,17 +1708,44 @@ class Import3DMigotoRaw(bpy.types.Operator, ImportHelper, IOOBJOrientationHelper
         dirname = os.path.dirname(self.filepath)
         for filename in self.files:
             try:
-                (vb_path, ib_path, fmt_path, vgmap_path) = self.get_vb_ib_paths(os.path.join(dirname, filename.name))
-                if os.path.normcase(vb_path) in done:
-                    continue
-                done.add(os.path.normcase(vb_path))
+                fname = os.path.join(dirname,filename.name)
+                vb_pattern = os.path.splitext(fname)[0] + '-vb*.fmt'
+                vb_paths = glob(vb_pattern)
+                fmt_path = os.path.splitext(fname)[0] + '.fmt'
+                if len(vb_paths) > 0:  # multiple .vb case, no standalone fmt and have multiple -vb*.fmt 
+                    paths = set()
+                    ib_paths = [vb_paths[0]]   #  ib does not have its own fmt, use vb fmt instead
+                    vgmap_path = os.path.splitext(fname)[0] + '.vgmap'    
+                    if not os.path.exists(vgmap_path):
+                        vgmap_path = None
 
-                if fmt_path is not None:
-                    import_3dmigoto_raw_buffers(self, context, fmt_path, fmt_path, vb_path=vb_path, ib_path=ib_path, vgmap_path=vgmap_path, **migoto_raw_import_options)
-                else:
-                    migoto_raw_import_options['vb_path'] = vb_path
-                    migoto_raw_import_options['ib_path'] = ib_path
-                    bpy.ops.import_mesh.migoto_input_format('INVOKE_DEFAULT')
+                    vb_bin_paths = [ os.path.splitext(x)[0] + '.vb' for x in vb_paths ]
+                    ib_bin_paths = [ os.path.splitext(fname)[0] + '.ib' ]  # single .ib
+                    if all([ os.path.exists(x) for x in itertools.chain(vb_bin_paths, ib_bin_paths) ]):
+                        # When loading the binary files, we still need to process
+                        # the .txt files as well, as they indicate the format:
+                        ib_paths = list(zip(ib_bin_paths, ib_paths))
+                        vb_paths = list(zip(vb_bin_paths, vb_paths))   
+                    else:
+                        raise Fatal('Unable to find matching .vb file for %s' % fname)
+
+                    paths.add((tuple(vb_paths), ib_paths[0], True, None))                         
+                    obj = import_3dmigoto(self, context, paths, **migoto_raw_import_options)  
+                    if obj and vgmap_path:
+                        apply_vgmap(operator, context, targets=obj, filepath=vgmap_path, rename=True, cleanup=True)
+
+                else:  # single .vb case
+                    (vb_path, ib_path, fmt_path, vgmap_path) = self.get_vb_ib_paths(os.path.join(dirname, filename.name))
+                    if os.path.normcase(vb_path) in done:
+                        continue
+                    done.add(os.path.normcase(vb_path))
+
+                    if fmt_path is not None:
+                        import_3dmigoto_raw_buffers(self, context, fmt_path, fmt_path, vb_path=vb_path, ib_path=ib_path, vgmap_path=vgmap_path, **migoto_raw_import_options)
+                    else:
+                        migoto_raw_import_options['vb_path'] = vb_path
+                        migoto_raw_import_options['ib_path'] = ib_path
+                        bpy.ops.import_mesh.migoto_input_format('INVOKE_DEFAULT')
             except Fatal as e:
                 self.report({'ERROR'}, str(e))
         return {'FINISHED'}
