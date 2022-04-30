@@ -1,5 +1,5 @@
-# 3d-fixes
-Expands on DarkStarSword's Blender Add-on, 3DMigoto Frame analysis dump with Multi-VB export and Multi-games support
+# 3DMigoto Blender add-on
+Expands on DarkStarSword's Blender add-on, 3DMigoto Frame analysis dump with Multi-VB export and Multi-games support
 
 - Add a "VB Format" drop down list to 3DMigoto Frame Analysis dump (vb.txt + ib.txt) import dialog which support game specific VB format.
 - VB Formats are defined in a dictionary in code: Supports conversion of mis-labelled dump element names and formats to the correct values. 
