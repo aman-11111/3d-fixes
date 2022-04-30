@@ -9,6 +9,6 @@ Expands on DarkStarSword's Blender add-on, 3DMigoto Frame analysis dump with Mul
 -       FFVII Remake       -> untested  
 -  Add a "Flip Face" check box to import dialog for games that needs their mesh face revese for Blender.
 -  Original Add-on can import Frame analysis dump that with multiple VBs  (one ib.txt  with multiple *-vb[n].txt and *-vb[n].buf). 
--  Add support for exporting Multi-VBs mesh as raw buffers, create multiple *-vb[n].vb files, each with its corresponding *-vb[*].fmt file. 
+-  Add support for exporting Multi-VBs mesh as raw buffers, create multiple *-vb[n].vb files, each with its corresponding *-vb[n].fmt file. 
 -  Exception: If all VBs in a multi-VBs mesh have the same layout and stride size. it will be exported as one single .vb with one .fmt file insteads.
 -  3DMigoto raw buffer import (.vb + .ib ) search for mulitple -vb[n].fmt files and import the .ib with *-vb[n].vb files.   
