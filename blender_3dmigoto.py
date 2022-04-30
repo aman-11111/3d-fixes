@@ -227,7 +227,7 @@ def EncoderDecoder(fmt):
 
 def pack_snorm10a2(components):
     r, g, b = numpy.around((numpy.fromiter(components[0:3], numpy.float32) + 1.0) * 511.5).astype(numpy.uint32).tolist()
-    a,      = numpy.around( numpy.fromiter(components[3:4], numpy.float32) * 3.0).astype(numpy.uint32).tolist()
+    a,      = numpy.around((numpy.fromiter(components[3:4], numpy.float32) + 1.0) * 1.5).astype(numpy.uint32).tolist()
     rgb_mask = 0b1111111111 # 10-bit mask
     value  = ( r & rgb_mask       )
     value |= ((g & rgb_mask) << 10)
@@ -243,7 +243,7 @@ def unpack_snorm10a2(data):
     b = ((value >> 20) & rgb_mask)
     a = ( value >> 30            ) # 2-bit alpha
     r, g, b = (numpy.fromiter([r, g, b], numpy.uint32) / 511.5 - 1.0).astype(numpy.float32).tolist()
-    a,      = (numpy.fromiter([a      ], numpy.uint32) / 3.0).astype(numpy.float32).tolist()
+    a,      = (numpy.fromiter([a      ], numpy.uint32) / 1.5 - 1.0).astype(numpy.float32).tolist()
     return [r, g, b, a]
  
 def pack_unorm10a2(components):
@@ -966,14 +966,19 @@ def import_vertex_groups(mesh, obj, blend_indices, blend_weights):
             bi_first_si = list(blend_indices.keys())[0] # blend_indices semantic_index could differ from blend_weights' semantic_index
             bw_first_si = list(blend_weights.keys())[0] # Don't expect there are more than one set of indices and weight anyway
             totalw = 0.0
-            for i, w in zip(blend_indices[bi_first_si][vertex.index], blend_weights[bw_first_si][vertex.index]):
+            seen = set()
+            for i, w in zip(blend_indices[bi_first_si][vertex.index], blend_weights[bw_first_si][vertex.index]):    
                 if w == 0.0:
-                    if totalw < 1.0:
-                        w = 1.0 - totalw  #  make sure there is no missing weight
+                    if totalw < 1.0 and not (i in seen):                        
+                        w = 1.0 - totalw   # GoW, 4th weight is always 0, calculate it
+                        if w < 0.0000000001: # not real weight, rounding error
+                            continue
                     else:
                         continue
                 totalw = totalw + w  
+                seen.add(i)
                 obj.vertex_groups[i].add((vertex.index,), w, 'REPLACE')
+
 def import_uv_layers(mesh, obj, texcoords, flip_texcoord_v):
     for (texcoord, data) in sorted(texcoords.items()):
         # TEXCOORDS can have up to four components, but UVs can only have two
